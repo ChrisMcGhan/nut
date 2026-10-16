@@ -1,0 +1,1116 @@
+Investigate native Windows NUT netclient only. You have NO TOOLS. The exact source excerpts below are your only evidence. Do not claim you read any other files, ran tests, or wrote files. Produce a concise report with: implemented service and shutdown flow; at most 3 concrete source-backed concerns; hypotheses requiring Windows runtime tests; five safe validation cases using a disposable VM and logging shutdown stub. Cite supplied path:line. Clearly distinguish inference from demonstrated defect. Do not discuss USB driver problems unrelated to netclient. Never invent paths. Source SHA: fe4e6fec3807017418c6fbc19b007a660d8e409c
+
+FILE scripts/Windows/wininit.c
+1: /* wininit.c - MS Windows service which replaces the init script
+2:                (compiled as "nut.exe")
+3: 
+4:    Copyright (C)
+5: 	2010	Frederic Bohe <fredericbohe@eaton.com>
+6: 	2021-2026	Jim Klimov <jimklimov+nut@gmail.com>
+7: 
+8:    This program is free software; you can redistribute it and/or modify
+9:    it under the terms of the GNU General Public License as published by
+10:    the Free Software Foundation; either version 2 of the License, or
+11:    (at your option) any later version.
+12: 
+13:    This program is distributed in the hope that it will be useful,
+14:    but WITHOUT ANY WARRANTY; without even the implied warranty of
+15:    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+16:    GNU General Public License for more details.
+17: 
+18:    You should have received a copy of the GNU General Public License
+19:    along with this program; if not, write to the Free Software
+20:    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+21: */
+22: 
+23: #ifdef WIN32
+24: 
+25: #include "config.h"	/* should be first */
+26: #include "common.h"
+27: #include "winevent.h"
+28: #include "wincompat.h"
+29: 
+30: #define NUT_START	TRUE
+31: #define NUT_STOP	FALSE
+32: 
+33: typedef struct conn_s {
+34: 	HANDLE		handle;
+35: 	OVERLAPPED	overlapped;
+36: 	char		buf[LARGEBUF];
+37: 	struct conn_s	*prev;
+38: 	struct conn_s	*next;
+39: } conn_t;
+40: 
+41: static int			exit_flag = 0;
+42: static DWORD			upsd_pid = 0;
+43: static DWORD			upsmon_pid = 0;
+44: static DWORD			upsdrvctl_pid = 0;
+45: static HANDLE			upsd_handle = INVALID_HANDLE_VALUE;
+46: static HANDLE			upsmon_handle = INVALID_HANDLE_VALUE;
+47: static HANDLE			upsdrvctl_handle = INVALID_HANDLE_VALUE;
+48: static BOOL			service_flag = TRUE;
+49: HANDLE				svc_stop = NULL;
+50: static SERVICE_STATUS		SvcStatus;
+51: static SERVICE_STATUS_HANDLE	SvcStatusHandle;
+52: 
+53: static void print_event(DWORD priority, const char * fmt, ...)
+54: {
+55: 	HANDLE EventSource;
+56: 	va_list ap;
+57: 	CHAR * buf;
+58: 	int ret;
+59: 
+60: 	buf = xmalloc(LARGEBUF);
+61: 
+62: 	va_start(ap, fmt);
+63: 	ret = vsnprintf(buf, LARGEBUF, fmt, ap);
+64: 	va_end(ap);
+65: 
+66: 	if (ret < 0) {
+67: 		return;
+68: 	}
+69: 
+70: 	if (!service_flag) {
+71: 		upslogx(LOG_ERR, "EventLog : %s\n",buf);
+72: 	}
+73: 
+74: 	EventSource = RegisterEventSource(NULL, SVCNAME);
+75: 
+76: 	if (NULL != EventSource) {
+77: 		ReportEvent(
+78: 				EventSource,	/* event log handle */
+79: 				priority,	/* event type */
+80: 				0,		/* event category */
+81: 				SVC_EVENT,	/* event identifier */
+82: 				NULL,		/* no security identifier*/
+83: 				1,		/* size of string array */
+84: 				0,		/* no binary data */
+85: 				(const char **)&buf,	/* array of string */
+86: 				NULL);		/* no binary data */
+87: 
+88: 		DeregisterEventSource(EventSource);
+89: 	}
+90: 
+91: 	if (buf)
+92: 		free(buf);
+93: }
+94: 
+95: /* returns PID of the newly created process or 0 on failure */
+96: static DWORD create_process(char * command, HANDLE *pHandle)
+97: {
+98: 	STARTUPINFO StartupInfo;
+99: 	PROCESS_INFORMATION ProcessInformation;
+100: 	BOOL res;
+101: 	DWORD LastError;
+102: 
+103: 	memset(&StartupInfo, 0, sizeof(STARTUPINFO));
+104: 	StartupInfo.cb = sizeof(StartupInfo);
+105: 	memset(&ProcessInformation, 0, sizeof(ProcessInformation));
+106: 
+107: 	upsdebugx(2, "%s: %s", __func__, NUT_STRARG(command));
+108: 	res = CreateProcess(
+109: 			NULL,
+110: 			command,
+111: 			NULL,
+112: 			NULL,
+113: 			FALSE,
+114: 			CREATE_NEW_PROCESS_GROUP,
+115: 			NULL,
+116: 			NULL,
+117: 			&StartupInfo,
+118: 			&ProcessInformation
+119: 			);
+120: 	LastError = GetLastError();
+121: 
+122: 	if (res == 0) {
+123: 		upsdebug_with_errno(1, "%s: failed to create process '%s'", __func__, NUT_STRARG(command));
+124: 		print_event(LOG_ERR, "Can't create process %s : %d", command, LastError);
+125: 		return 0;
+126: 	}
+127: 
+128: 	upsdebugx(3, "%s: %s returned PID: %" PRIiMAX, __func__,
+129: 		NUT_STRARG(command), (intmax_t)(ProcessInformation.dwProcessId));
+130: 	if (pHandle)
+131: 		*pHandle = ProcessInformation.hProcess;
+132: 	return  ProcessInformation.dwProcessId;
+133: }
+134: 
+135: /* Return a statically allocated buffer, no need to free() it */
+136: static const char * makearg_debug(void)
+137: {
+138: 	static char	buf[SMALLBUF];
+139: 	char	*p = buf;
+140: 	size_t	i;
+141: 
+142: 	if (nut_debug_level < 1)
+143: 		return("");
+144: 
+145: 	*p = '-';
+146: 	p++;
+147: 	for (i = 0; (i < (size_t)nut_debug_level && i < (sizeof(buf) - 2)); i++, p++) {
+148: 		*p = 'D';
+149: 	}
+150: 	*p = '\0';
+151: 
+152: 	return (const char *)buf;
+153: }
+154: 
+155: /* return PID of created process or 0 on failure */
+156: static DWORD run_drivers(void)
+157: {
+158: 	char command[NUT_PATH_MAX + 1];
+159: 	char *path;
+160: 
+161: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+162: 	if (nut_debug_level < 1) {
+163: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe start", path);
+164: 	} else {
+165: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe -d %s start",
+166: 			path, makearg_debug());
+167: 	}
+168: 	free(path);
+169: 
+170: 	upsdrvctl_pid = create_process(command, &upsdrvctl_handle);
+171: 	return upsdrvctl_pid;
+172: }
+173: 
+174: /* return PID of created process or 0 on failure */
+175: static DWORD stop_drivers(void)
+176: {
+177: 	char command[NUT_PATH_MAX + 1];
+178: 	char *path;
+179: 
+180: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+181: 	if (nut_debug_level < 1) {
+182: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe stop", path);
+183: 	} else {
+184: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe %s stop",
+185: 			path, makearg_debug());
+186: 	}
+187: 	free(path);
+188: 	return create_process(command, NULL);
+189: }
+190: 
+191: /* return PID of created process or 0 on failure */
+192: static void run_upsd(void)
+193: {
+194: 	char command[NUT_PATH_MAX + 1];
+195: 	char *path;
+196: 
+197: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+198: 	snprintf(command, sizeof(command), "%s\\upsd.exe", path);
+199: 	if (nut_debug_level > 0) {
+200: 		snprintfcat(command, sizeof(command), " %s", makearg_debug());
+201: 	}
+202: 	free(path);
+203: 	upsd_pid = create_process(command, &upsd_handle);
+204: }
+205: 
+206: static void stop_upsd(void)
+207: {
+208: 	upsdebugx(3, "%s: using pipe '%s' to stop PID: %" PRIiMAX, __func__,
+209: 		NUT_STRARG(UPSD_PIPE_NAME), (intmax_t)(upsd_pid));
+210: 	if (sendsignal(UPSD_PIPE_NAME, COMMAND_STOP, 0)) {
+211: 		print_event(LOG_ERR, "Error stopping upsd (%d)", GetLastError());
+212: 	}
+213: }
+214: 
+215: /* return PID of created process or 0 on failure */
+216: static void run_upsmon(void)
+217: {
+218: 	char command[NUT_PATH_MAX + 1];
+219: 	char *path;
+220: 
+221: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+222: 	snprintf(command, sizeof(command), "%s\\upsmon.exe", path);
+223: 	if (nut_debug_level > 0) {
+224: 		snprintfcat(command, sizeof(command), " %s", makearg_debug());
+225: 	}
+226: 	free(path);
+227: 	upsmon_pid = create_process(command, &upsmon_handle);
+228: }
+229: 
+230: static void stop_upsmon(void)
+231: {
+232: 	upsdebugx(3, "%s: using pipe '%s' to stop PID: %" PRIiMAX, __func__,
+233: 		NUT_STRARG(UPSMON_PIPE_NAME), (intmax_t)(upsmon_pid));
+234: 	if (sendsignal(UPSMON_PIPE_NAME, COMMAND_STOP, 0)) {
+235: 		print_event(LOG_ERR, "Error stopping upsmon (%d)", GetLastError());
+236: 	}
+237: }
+238: 
+239: /* Return 0 if powerdown flag is set */
+240: static DWORD test_powerdownflag(void)
+241: {
+242: 	char command[NUT_PATH_MAX + 1];
+243: 	char *path;
+244: 	STARTUPINFO StartupInfo;
+245: 	PROCESS_INFORMATION ProcessInformation;
+246: 	BOOL res;
+247: 	DWORD LastError;
+248: 	DWORD status;
+249: 	int i = 10;
+250: 	int timeout = 500;
+251: 
+252: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+253: 	snprintf(command, sizeof(command), "%s\\upsmon.exe -K", path);
+254: 	if (nut_debug_level > 0) {
+255: 		snprintfcat(command, sizeof(command), " %s", makearg_debug());
+256: 	}
+257: 	free(path);
+258: 
+259: 	memset(&StartupInfo, 0, sizeof(STARTUPINFO));
+260: 	StartupInfo.cb = sizeof(StartupInfo);
+261: 	memset(&ProcessInformation, 0, sizeof(ProcessInformation));
+262: 
+263: 	upsdebugx(2, "%s: launch %s", __func__, command);
+264: 	res = CreateProcess(
+265: 			NULL,
+266: 			command,
+267: 			NULL,
+268: 			NULL,
+269: 			FALSE,
+270: 			CREATE_NEW_PROCESS_GROUP,
+271: 			NULL,
+272: 			NULL,
+273: 			&StartupInfo,
+274: 			&ProcessInformation
+275: 			);
+276: 	LastError = GetLastError();
+277: 
+278: 	if (res == 0) {
+279: 		upsdebug_with_errno(1, "%s: failed to create process '%s'", __func__, command);
+280: 		print_event(LOG_ERR, "Can't create process %s : %d", command, LastError);
+281: 		return 1;
+282: 	}
+283: 
+284: 	while (i > 0) {
+285: 		res = GetExitCodeProcess(ProcessInformation.hProcess, &status);
+286: 		if (res != 0) {
+287: 			if (status != STILL_ACTIVE) {
+288: 				upsdebugx(1, "%s: powerdownflag check returned: %d", __func__, status);
+289: 				return status;
+290: 			}
+291: 		}
+292: 		Sleep(timeout);
+293: 		i--;
+294: 	}
+295: 
+296: 	upsdebugx(1, "%s: powerdownflag check timed out", __func__);
+297: 	return 1;
+298: }
+299: 
+300: static DWORD shutdown_ups(void)
+301: {
+302: 	char command[NUT_PATH_MAX + 1];
+303: 	char *path;
+304: 
+305: 	path = getfullpath2(SBINDIR, PATH_SBIN);
+306: 	if (nut_debug_level < 1) {
+307: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe shutdown", path);
+308: 	} else {
+309: 		snprintf(command, sizeof(command), "%s\\upsdrvctl.exe -d %s shutdown",
+310: 			path, makearg_debug());
+311: 	}
+312: 	free(path);
+313: 	return create_process(command, NULL);
+314: }
+315: 
+316: /* return 0 on failure */
+317: static int parse_nutconf(BOOL start_flag)
+318: {
+319: 	char	fn[NUT_PATH_MAX + 1];
+320: 	FILE	*nutf;
+321: 	char	buf[SMALLBUF];
+322: 	char	fullname[NUT_PATH_MAX + 1];
+323: 
+324: 	snprintf(fn, sizeof(fn), "%s/nut.conf", confpath());
+325: 
+326: 	nutf = fopen(fn, "r");
+327: 	if (nutf == NULL) {
+328: 		snprintf(buf, sizeof(buf), "Error opening %s", fn);
+329: 		print_event(LOG_ERR, buf);
+330: 		return 0;
+331: 	}
+332: 
+333: 	upsdebugx(1, "%s: parsing config file: %s", __func__, fn);
+334: 	while (fgets(buf, sizeof(buf), nutf) != NULL) {
+335: 		if (buf[0] != '#') {
+336: 			if (strstr(buf, "standalone") != NULL
+337: 			||  strstr(buf, "netserver") != NULL
+338: 			) {
+339: 				upsdebugx(2, "%s: saw 'standalone' or 'netserver' on a non-comment line, assuming this is MODE", __func__);
+340: 				if (start_flag == NUT_START) {
+341: 					print_event(LOG_INFO, "Starting drivers");
+342: 					run_drivers();
+343: 					print_event(LOG_INFO, "Starting upsd");
+344: 					run_upsd();
+345: 
+346: 					/* Wait a moment for the drivers to start */
+347: 					Sleep(5000);
+348: 					print_event(LOG_INFO, "Starting upsmon");
+349: 					run_upsmon();
+350: 					return 1;
+351: 				}
+352: 				else {
+353: 					print_event(LOG_INFO, "Stopping upsd");
+354: 					stop_upsd();
+355: 					print_event(LOG_INFO, "Stopping drivers");
+356: 					stop_drivers();
+357: 					print_event(LOG_INFO, "Stopping upsmon");
+358: 					stop_upsmon();
+359: 
+360: 					/* Give upsmon a chance to write the POWERDOWNFLAG file */
+361: 					Sleep(1000);
+362: 					if (test_powerdownflag() == 0) {
+363: 						print_event(LOG_INFO, "Shutting down the UPS");
+364: 						shutdown_ups();
+365: 					}
+366: 					print_event(LOG_INFO, "End of NUT stop");
+367: 					return 1;
+368: 				}
+369: 			}
+370: 			if (strstr(buf, "netclient") != NULL) {
+371: 				upsdebugx(2, "%s: saw 'netclient' on a non-comment line, assuming this is MODE", __func__);
+372: 				if (start_flag == NUT_START) {
+373: 					print_event(LOG_INFO, "Starting upsmon (client only)");
+374: 					run_upsmon();
+375: 					return 1;
+376: 				}
+377: 				else {
+378: 					print_event(LOG_INFO, "Stopping upsmon (client only)");
+379: 					stop_upsmon();
+380: 					return 1;
+381: 				}
+382: 			}
+383: 		}
+384: 	}
+385: 
+386: 	GetFullPathName(fn, sizeof(fullname), fullname, NULL);
+387: 	snprintf(buf, sizeof(buf),
+388: 		"NUT disabled, please adjust the configuration to your needs. "
+389: 		"Then set MODE to a suitable value in %s to enable it.",
+390: 		fullname);
+391: 	print_event(LOG_ERR, buf);
+392: 	return 0;
+393: }
+394: 
+395: static int SvcInstall(const char * SvcName, const char * args)
+396: {
+397: 	SC_HANDLE SCManager;
+398: 	SC_HANDLE Service;
+399: 	TCHAR Path[NUT_PATH_MAX + 1];
+400: 
+401: 	if (!GetModuleFileName(NULL, Path, NUT_PATH_MAX)) {
+402: 		upsdebug_with_errno(1, "%s: Could not GetModuleFileName() of current program", __func__);
+403: 		printf("Cannot install service (%d)\n", (int)GetLastError());
+404: 		return EXIT_FAILURE;
+405: 	}
+406: 
+407: 	if (args != NULL) {
+408: 		snprintfcat(Path, sizeof(Path), " %s", args);
+409: 	}
+410: 
+411: 	SCManager = OpenSCManager(
+412: 			NULL,			/* local computer */
+413: 			NULL,			/* ServiceActive database */
+414: 			SC_MANAGER_ALL_ACCESS);	/* full access rights */
+415: 
+416: 	if (NULL == SCManager) {
+417: 		upsdebug_with_errno(1, "%s: Could not OpenSCManager()", __func__);
+418: 		upslogx(LOG_ERR, "OpenSCManager failed (%d)\n", (int)GetLastError());
+419: 		return EXIT_FAILURE;
+420: 	}
+421: 
+422: 	Service = CreateService(
+423: 			SCManager,			/* SCM database */
+424: 			SvcName,			/* name of service */
+425: 			SvcName,			/* service name to display */
+426: 			SERVICE_ALL_ACCESS,		/* desired access */
+427: 			SERVICE_WIN32_OWN_PROCESS,	/* service type */
+428: 			SERVICE_AUTO_START,		/* start type */
+429: 			SERVICE_ERROR_NORMAL,		/* error control type */
+430: 			Path,				/* path to service binary */
+431: 			NULL,				/* no load ordering group */
+432: 			NULL,				/* no tag identifier */
+433: 			NULL,				/* no dependencies */
+434: 			NULL,				/* LocalSystem account */
+435: 			NULL);				/* no password */
+436: 
+437: 	if (Service == NULL) {
+438: 		upsdebug_with_errno(1, "%s: Could not CreateService()", __func__);
+439: 		upslogx(LOG_ERR, "CreateService failed (%d)\n", (int)GetLastError());
+440: 		CloseServiceHandle(SCManager);
+441: 		return EXIT_FAILURE;
+442: 	}
+443: 	else {
+444: 		upslogx(LOG_INFO, "Service installed successfully\n");
+445: 	}
+446: 
+447: #ifdef SERVICE_CONFIG_DESCRIPTION
+448: 	{ /* scope */
+449: 		SERVICE_DESCRIPTIONA	descr;
+450: 		descr.lpDescription = "The Network UPS Tools (NUT) project "
+451:                         "provides monitoring and management of "
+452:                         "Uninterruptible Power Sources (UPS) and similar hardware, "
+453:                         "allowing for multiple systems fed by an UPS to be "
+454:                         "safely shut down in case of a power outage. "
+455:                         "For more details please see " NUT_WEBSITE_BASE;
+456: 
+457: 		ChangeServiceConfig2A(Service, SERVICE_CONFIG_DESCRIPTION, &descr);
+458: 	}
+459: #endif
+460: 
+461: 	CloseServiceHandle(Service);
+462: 	CloseServiceHandle(SCManager);
+463: 
+464: 	return EXIT_SUCCESS;
+465: }
+466: 
+467: /* Returns a positive value if the service name exists
+468:  * -2 if we can not open the service manager
+469:  * -1 if we can not open the service itself
+470:  * +1 SvcName exists
+471:  */
+472: static int SvcExists(const char * SvcName)
+473: {
+474: 	SC_HANDLE SCManager;
+475: 	SC_HANDLE Service;
+476: 
+477: 	SCManager = OpenSCManager(
+478: 			NULL,			/* local computer */
+479: 			NULL,			/* ServicesActive database */
+480: 			SC_MANAGER_ALL_ACCESS);	/* full access rights */
+481: 
+482: 	if (NULL == SCManager) {
+483: 		upsdebug_with_errno(1, "%s: Could not OpenSCManager()", __func__);
+484: 		upslogx(LOG_ERR, "OpenSCManager failed (%d)\n", (int)GetLastError());
+485: 		return -2;
+486: 	}
+487: 
+488: 	Service = OpenService(
+489: 			SCManager,	/* SCM database */
+490: 			SvcName,	/* name of service */
+491: 			DELETE);	/* need delete access */
+492: 
+493: 	if (Service == NULL) {
+494: 		upsdebug_with_errno(1, "%s: OpenService failed for '%s'",
+495: 			__func__, SvcName);
+496: 		upslogx(LOG_ERR, "OpenService failed (%d)\n", (int)GetLastError());
+497: 		CloseServiceHandle(SCManager);
+498: 		return -1;
+499: 	}
+500: 
+501: 	CloseServiceHandle(Service);
+502: 	CloseServiceHandle(SCManager);
+503: 
+504: 	upsdebugx(1, "%s: Service '%s' seems to exist", __func__, SvcName);
+505: 	return 1;
+506: }
+507: 
+508: static int SvcUninstall(const char * SvcName)
+509: {
+510: 	SC_HANDLE SCManager;
+511: 	SC_HANDLE Service;
+512: 
+513: 	SCManager = OpenSCManager(
+514: 			NULL,			/* local computer */
+515: 			NULL,			/* ServicesActive database */
+516: 			SC_MANAGER_ALL_ACCESS);	/* full access rights */
+517: 
+518: 	if (NULL == SCManager) {
+519: 		upsdebug_with_errno(1, "%s: Could not OpenSCManager()", __func__);
+520: 		upslogx(LOG_ERR, "OpenSCManager failed (%d)\n", (int)GetLastError());
+521: 		return EXIT_FAILURE;
+522: 	}
+523: 
+524: 	Service = OpenService(
+525: 			SCManager,	/* SCM database */
+526: 			SvcName,	/* name of service */
+527: 			DELETE);	/* need delete access */
+528: 
+529: 	if (Service == NULL) {
+530: 		upsdebug_with_errno(1, "%s: OpenService failed for '%s'",
+531: 			__func__, SvcName);
+532: 		upslogx(LOG_ERR, "OpenService failed (%d)\n", (int)GetLastError());
+533: 		CloseServiceHandle(SCManager);
+534: 		return EXIT_FAILURE;
+535: 	}
+536: 
+537: 	if (!DeleteService(Service))  {
+538: 		upsdebug_with_errno(1, "%s: Could not DeleteService()", __func__);
+539: 		upslogx(LOG_ERR, "DeleteService failed (%d)\n", (int)GetLastError());
+540: 	}
+541: 	else {
+542: 		upslogx(LOG_INFO, "Service deleted successfully\n");
+543: 	}
+544: 
+545: 	CloseServiceHandle(Service);
+546: 	CloseServiceHandle(SCManager);
+547: 
+548: 	return EXIT_SUCCESS;
+549: }
+550: 
+551: /* Report the status of the service to the Windows SCM
+552:  * FIXME: Combine with common.c SMF/systemd/... notifier?
+553:  */
+554: static void ReportSvcStatus(
+555: 		DWORD CurrentState,
+556: 		DWORD Win32ExitCode,
+557: 		DWORD WaitHint)
+558: {
+559: 	static DWORD CheckPoint = 1;
+560: 
+561: 	SvcStatus.dwCurrentState = CurrentState;
+562: 	SvcStatus.dwWin32ExitCode = Win32ExitCode;
+563: 	SvcStatus.dwWaitHint = WaitHint;
+564: 
+565: 	/* FIXME: Find a way to stringify? */
+566: 	upsdebugx(2, "%s: reporting transition to status %d", __func__, CurrentState);
+567: 
+568: 	if (CurrentState == SERVICE_START_PENDING)
+569: 		SvcStatus.dwControlsAccepted = 0;
+570: 	else SvcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+571: 
+572: 	if ( (CurrentState == SERVICE_RUNNING)
+573: 	||   (CurrentState == SERVICE_STOPPED)
+574: 	) {
+575: 		SvcStatus.dwCheckPoint = 0;
+576: 	}
+577: 	else {
+578: 		SvcStatus.dwCheckPoint = CheckPoint++;
+579: 	}
+580: 
+581: 	/* report the status of the service to the SCM */
+582: 	SetServiceStatus(SvcStatusHandle, &SvcStatus);
+583: }
+584: 
+585: /* For `nut.exe -N` runs
+586:  * https://learn.microsoft.com/en-us/windows/console/registering-a-control-handler-function
+587:  */
+588: static BOOL WINAPI ConsoleCtrlHandler(DWORD Ctrl)
+589: {
+590: 	switch(Ctrl)
+591: 	{
+592: 		case CTRL_C_EVENT:
+593: 			print_event(LOG_INFO, "Ctrl+C received on console");
+594: 			exit_flag = 1;	/* Break SvcMain() infinite loop */
+595: 			if (upsmon_pid) {
+596: 				print_event(LOG_INFO, "Stopping upsmon");
+597: 				stop_upsmon();
+598: 			}
+599: 			if (upsd_pid) {
+600: 				print_event(LOG_INFO, "Stopping upsd");
+601: 				stop_upsd();
+602: 			}
+603: 			if (upsdrvctl_pid) {
+604: 				print_event(LOG_INFO, "Stopping drivers");
+605: 				stop_drivers();
+606: 			}
+607: 			exit_flag = 2;	/* Allow to finish SvcMain() infinite loop and proceed to exit() */
+608: 			/* confirm that the user wants to exit */
+609: 			return TRUE;
+610: 
+611: 		case CTRL_CLOSE_EVENT:
+612: 			print_event(LOG_INFO, "Close event received on console, currently ignored");
+613: 			return FALSE;
+614: 
+615: 		case CTRL_BREAK_EVENT:
+616: 			print_event(LOG_INFO, "Ctrl+Break event received on console, currently ignored");
+617: 			return FALSE;
+618: 
+619: 		/* TOTHINK: Do we in fact want these two handled specially? */
+620: 		case CTRL_LOGOFF_EVENT:
+621: 			print_event(LOG_INFO, "Logoff event received on console, currently ignored");
+622: 			return FALSE;
+623: 
+624: 		case CTRL_SHUTDOWN_EVENT:
+625: 			print_event(LOG_INFO, "Shutdown event received on console, currently ignored");
+626: 			return FALSE;
+627: 
+628: 		default:
+629: 			return FALSE;
+630: 	}
+631: }
+632: 
+633: static void WINAPI SvcCtrlHandler(DWORD Ctrl)
+634: {
+635: 	switch(Ctrl)
+636: 	{
+637: 		case SERVICE_CONTROL_STOP:
+638: 		case SERVICE_CONTROL_SHUTDOWN:
+639: 			upsdebugx(1, "%s: report SERVICE_STOP_PENDING", __func__);
+640: 			ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+641: 
+642: 			/* Signal the service to stop */
+643: 			upsdebugx(1, "%s: report actual service stop/shutdown type...", __func__);
+644: 			SetEvent(svc_stop);
+645: 			ReportSvcStatus(SvcStatus.dwCurrentState, NO_ERROR, 0);
+646: 
+647: 			return;
+648: 
+649: 		case SERVICE_CONTROL_INTERROGATE:
+650: 			break;
+651: 
+652: 		default:
+653: 			break;
+654: 	}
+655: }
+656: 
+657: static void SvcStart(char * SvcName)
+658: {
+659: 	/* Register the handler function for the service */
+660: 	SvcStatusHandle = RegisterServiceCtrlHandler(
+661: 			SvcName,
+662: 			SvcCtrlHandler);
+663: 
+664: 	if (!SvcStatusHandle) {
+665: 		upsdebug_with_errno(1, "%s: RegisterServiceCtrlHandler failed for '%s'",
+666: 			__func__, SvcName);
+667: 		upslogx(LOG_ERR, "RegisterServiceCtrlHandler\n");
+668: 		return;
+669: 	}
+670: 
+671: 	SvcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+672: 	SvcStatus.dwServiceSpecificExitCode = 0;
+673: 
+674: 	/* Report initial status to the SCM */
+675: 	upsdebugx(1, "%s: report SERVICE_START_PENDING", __func__);
+676: 	ReportSvcStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+677: }
+678: 
+679: static void SvcReady(void)
+680: {
+681: 	svc_stop = CreateEvent(
+682: 			NULL,	/* default security attributes */
+683: 			TRUE,	/* manual reset event */
+684: 			FALSE,	/* not signaled */
+685: 			NULL);	/* no name */
+686: 
+687: 	if (svc_stop == NULL) {
+688: 		upsdebugx(1, "%s: report SERVICE_STOPPED", __func__);
+689: 		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+690: 		return;
+691: 	}
+692: 
+693: 	upsdebugx(1, "%s: report SERVICE_RUNNING", __func__);
+694: 	ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
+695: }
+696: 
+697: static void close_all(void)
+698: {
+699: 	pipe_conn_t	*conn;
+700: 
+701: 	upsdebugx(3, "%s: closing all connections (if any)", __func__);
+702: 	for (conn = pipe_connhead; conn; conn = conn->next) {
+703: 		pipe_disconnect(conn);
+704: 	}
+705: 
+706: }
+707: 
+708: static void WINAPI SvcMain(DWORD argc, LPTSTR *argv)
+709: {
+710: 	DWORD	ret;
+711: 	HANDLE	handles[MAXIMUM_WAIT_OBJECTS];  /* 64 per current WinAPI headers */
+712: 	size_t	maxhandle = 0;
+713: 	pipe_conn_t	*conn;
+714: 	DWORD	priority;
+715: 	char	*buf;
+716: 
+717: 	NUT_UNUSED_VARIABLE(argc);
+718: 	NUT_UNUSED_VARIABLE(argv);
+719: 
+720: 	if (service_flag) {
+721: 		upsdebugx(3, "%s: starting service...", __func__);
+722: 		SvcStart(SVCNAME);
+723: 	}
+724: 
+725: 	/* A service has no console, so do has its children. */
+726: 	/* So if we want to be able to send CTRL+BREAK signal we must */
+727: 	/* create a console which will be inherited by children */
+728: 	AllocConsole();
+729: 
+730: 	print_event(LOG_INFO, "Starting");
+731: 
+732: 	/* pipe for event log proxy */
+733: 	upsdebugx(3, "%s: calling pipe_create()...", __func__);
+734: 	pipe_create(EVENTLOG_PIPE_NAME);
+735: 
+736: 	/* parse nut.conf and start relevant processes */
+737: 	if (parse_nutconf(NUT_START) == 0) {
+738: 		print_event(LOG_INFO, "exiting");
+739: 		if (service_flag) {
+740: 			ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+741: 		}
+742: 		return;
+743: 	}
+744: 
+745: 	if (service_flag) {
+746: 		SvcReady();
+747: 	}
+748: 
+749: 	while (!exit_flag) {
+750: 		maxhandle = 0;
+751: 		memset(&handles, 0, sizeof(handles));
+752: 
+753: 		/* Wait on the read IO of each connections */
+754: 		for (conn = pipe_connhead; conn; conn = conn->next) {
+755: 			/* Leave one or two for "new event" below */
+756: 			if (maxhandle + 1 + (service_flag ? 1 : 0) >= sizeof(handles)) {
+757: 				upsdebugx(1, "%s: skipping handle: too many connected already", __func__);
+758: 				continue;
+759: 			}
+760: 			handles[maxhandle] = conn->overlapped.hEvent;
+761: 			maxhandle++;
+762: 		}
+763: 
+764: 		/* Add the "new pipe connected" event */
+765: 		handles[maxhandle] = pipe_connection_overlapped.hEvent;
+766: 		maxhandle++;
+767: 
+768: 		/* Add SCM event handler in service mode*/
+769: 		if (service_flag) {
+770: 			handles[maxhandle] = svc_stop;
+771: 			maxhandle++;
+772: 		}
+773: 
+774: 		ret = WaitForMultipleObjects(maxhandle, handles, FALSE, INFINITE);
+775: 
+776: 		if (ret == WAIT_FAILED) {
+777: 			print_event(LOG_ERR, "Wait failed");
+778: 			upsdebug_with_errno(1, "%s: WaitForMultipleObjects", __func__);
+779: 			return;
+780: 		}
+781: 
+782: 		if (handles[ret] == svc_stop && service_flag) {
+783: 			parse_nutconf(NUT_STOP);
+784: 			if (service_flag) {
+785: 				print_event(LOG_INFO, "Exiting");
+786: 				close_all();
+787: 				ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+788: 			}
+789: 			return;
+790: 		}
+791: 
+792: 		/* Retrieve the signaled connection */
+793: 		for (conn = pipe_connhead; conn != NULL; conn = conn->next) {
+794: 			if (conn->overlapped.hEvent == handles[ret - WAIT_OBJECT_0]) {
+795: 				break;
+796: 			}
+797: 		}
+798: 
+799: 		if (handles[ret] == pipe_connection_overlapped.hEvent) {
+800: 			/* a new pipe connection has been signaled */
+FILE clients/upsmon.c
+940: 	}
+941: 
+942: 	fprintf(pdf, "%s", SDMAGIC);
+943: 	fclose(pdf);
+944: }
+945: 
+946: /* the actual shutdown procedure */
+947: static void doshutdown(void)
+948: 	__attribute__((noreturn));
+949: 
+950: static void doshutdown(void)
+951: {
+952: 	time_t	start;
+953: 
+954: 	/* NOTE: This method typically runs in the unprivileged child
+955: 	 * sub-process, unless we do not use_pipe and run as a monolith.
+956: 	 * It can block for a while or forever (depending on SHUTOWNEXIT
+957: 	 * setting), otherwise it exits the (child part of) upsmon daemon.
+958: 	 */
+959: 	upsdebugx(1, "%s: starting...", __func__);
+960: 
+961: 	upsnotify(NOTIFY_STATE_STOPPING, "Executing automatic power-fail shutdown");
+962: 	upsnotify_extend_timeout_usec = UPSNOTIFY_EXTEND_TIMEOUT_USEC_INFINITY;
+963: 	upsnotify(NOTIFY_STATE_EXTEND_TIMEOUT, NULL);
+964: 
+965: 	/* this should probably go away at some point */
+966: 	upslogx(LOG_CRIT, "Executing automatic power-fail shutdown");
+967: 	wall("Executing automatic power-fail shutdown\n");
+968: 
+969: 	do_notify(NULL, NOTIFY_SHUTDOWN, NULL);
+970: 
+971: 	if (finaldelay > 0) {
+972: 		time_t	now;
+973: 
+974: 		upsdebugx(1, "%s: waiting for FINALDELAY=%u (to let notification handling complete)...",
+975: 			__func__, finaldelay);
+976: 
+977: 		/* FIXME: Track and check if the current system (or NUT build)
+978: 		 *  supports notifications and service watchdog in particular;
+979: 		 *  if not - use a chaper simple sleep(finaldelay) right away.
+980: 		 */
+981: 		time(&start);
+982: 		time(&now);
+983: 
+984: 		while (difftime(now, start) < finaldelay) {
+985: 			sleep(1);
+986: 			upsnotify(NOTIFY_STATE_WATCHDOG, NULL);
+987: 			time(&now);
+988: 		}
+989: 	} else {
+990: 		upsdebugx(1, "%s: FINALDELAY=%u (not waiting to let notification handling complete)...",
+991: 			__func__, finaldelay);
+992: 	}
+993: 
+994: 	/* If we would handle SHUTDOWNEXIT as a finite delay below,
+995: 	 * that time should include the duration of SHUTDOWNCMD too */
+996: 	time(&start);
+997: 
+998: 	/* in the pipe model, we let the parent do this for us */
+999: 	if (use_pipe) {
+1000: 		char	ch;
+1001: 		ssize_t	wret;
+1002: 
+1003: 		ch = 1;
+1004: 		upslogx(2, "%s: call parent pipe for shutdown (async)", __func__);
+1005: 		wret = write(pipefd[1], &ch, 1);
+1006: 
+1007: 		if (wret < 1)
+1008: 			upslogx(LOG_ERR, "Unable to call parent pipe for shutdown");
+1009: 	} else {
+1010: 		/* one process model = we do all the work here */
+1011: 		int	sret;
+1012: 
+1013: #ifndef WIN32
+1014: 		if (geteuid() != 0)
+1015: 			upslogx(LOG_WARNING, "Not root, shutdown may fail");
+1016: #endif	/* !WIN32 */
+1017: 
+1018: 		set_pdflag();
+1019: 
+1020: 		upsdebugx(2, "%s: directly call shutdown command (sync)", __func__);
+1021: 		upsnotify(NOTIFY_STATE_EXTEND_TIMEOUT, "Mono-process: calling shutdown command (directly)");
+1022: 
+1023: #ifdef WIN32
+1024: 		SC_HANDLE SCManager;
+1025: 		SC_HANDLE Service;
+1026: 		SERVICE_STATUS Status;
+1027: 
+1028: 		SCManager = OpenSCManager(
+1029: 				NULL,	/* local computer */
+1030: 				NULL,	/* ServiceActive database */
+1031: 				SC_MANAGER_ALL_ACCESS); /* full access rights */
+1032: 
+1033: 		if (NULL == SCManager) {
+1034: 			upslogx(LOG_ERR, "OpenSCManager failed (%d)\n", (int)GetLastError());
+1035: 		}
+1036: 		else {
+1037: 			Service = OpenService(SCManager,SVCNAME,SERVICE_STOP);
+1038: 			if (Service == NULL) {
+1039: 				upslogx(LOG_ERR,"OpenService  failed (%d)\n", (int)GetLastError());
+1040: 			}
+1041: 			else {
+1042: 				ControlService(Service,SERVICE_CONTROL_STOP,&Status);
+1043: 				/* Give time to the service to stop */
+1044: 				Sleep(2000);
+1045: 			}
+1046: 		}
+1047: #endif	/* WIN32 */
+1048: 
+1049: 		/* NOTE: Unlike NOTIFYCMD whose arg[0] MUST be a program path name
+1050: 		 *  (so we can pass additional args safely), we do not currently
+1051: 		 *  require that of the SHUTDOWNCMD whose one string may contain
+1052: 		 *  further arguments right away. We, however, do support multi-token
+1053: 		 *  syntax for that directive too.
+1054: 		 */
+1055: 		upsdebugx(1, "%s: upsmon mono-process: Calling shutdown command: %s",
+1056: 			__func__, NUT_STRARG(shutdowncmd_concat));
+1057: 		sret = system(shutdowncmd_concat);
+1058: 
+1059: 		if (sret != 0)
+1060: 			upslogx(LOG_ERR, "Unable to call shutdown command: %s",
+1061: 				shutdowncmd_concat);
+1062: 	}
+1063: 
+1064: 	/* code below runs in the child (or only) process */
+1065: 	upsdebugx(1, "%s: current exit_flag=%i", __func__, exit_flag);
+1066: 	if (shutdownexitdelay == 0) {
+1067: 		upsdebugx(1,
+1068: 			"Exiting upsmon immediately "
+1069: 			"after initiating shutdown, by default");
+1070: 	} else {
+1071: 		time_t	now;
+1072: 
+1073: 		if (shutdownexitdelay < 0) {
+1074: 			upslogx(LOG_WARNING,
+1075: 				"Configured to not exit upsmon "
+1076: 				"after initiating shutdown");
+1077: 			upsnotify(NOTIFY_STATE_EXTEND_TIMEOUT, "Child/Mono-process: "
+1078: 				"Configured to not exit upsmon after initiating shutdown");
+1079: 		} else {
+1080: 			upslogx(LOG_WARNING,
+1081: 				"Configured to only exit upsmon SHUTDOWNEXIT=%d sec "
+1082: 				"after initiating shutdown", shutdownexitdelay);
+1083: 			upsnotify(NOTIFY_STATE_EXTEND_TIMEOUT, "Child/Mono-process: "
+1084: 				"Configured to only exit upsmon some time after initiating shutdown");
+1085: 		}
+1086: 		if (exit_flag) {
+1087: 			/* TOTHINK: Are there cases when we want to
+1088: 			 * ignore it? Or is a SIGTERM, SIGBRK etc.
+1089: 			 * a good enough reason to do exit quickly? */
+1090: 			upslogx(LOG_WARNING,
+1091: 				"Note that 'exit_flag' was raised by a "
+1092: 				"signal, so this process will not in fact "
+1093: 				"wait that long");
+1094: 		}
+1095: 
+1096: 		/* Technically, here we sleep until SIGTERM or poweroff,
+1097: 		 * or in case of initially positive shutdownexitdelay --
+1098: 		 * when it counts down to zero.
+1099: 		 */
+1100: 		do {
+FILE docs/man/nut.exe.txt
+1: NUT.EXE(8)
+2: ==========
+3: 
+4: NAME
+5: ----
+6: 
+7: nut.exe - NUT for Windows wrapper for all-in-one service
+8: 
+9: SYNOPSIS
+10: --------
+11: 
+12: *nut.exe* {-h | /?}
+13: 
+14: *nut.exe* ['OPTIONS']
+15: 
+16: *nut.exe* (as a service implementation)
+17: 
+18: DESCRIPTION
+19: -----------
+20: 
+21: *nut.exe* wraps NUT programs to start and stop as a Windows service.
+22: 
+23: Depending on linkman:nut.conf[5] setting of 'MODE', it would manage the
+24: bundle of driver(s), linkman:upsd[8] data server and linkman:upsmon[8] client,
+25: as well as attempt an UPS shutdown command in case of FSD handling, or for
+26: mere 'netclient' systems it would run just the linkman:upsmon[8] client to
+27: monitor remote UPS device(s) and initiate the OS shut down on the local
+28: Windows system as applicable.
+29: 
+30: Beside launching or stopping a set of the NUT programs in certain cases,
+31: this helper program also allows to register (or un-register) itself as a
+32: Windows service. To actually manage the service from command line you can
+33: execute the Windows `net` or `sc` commands, e.g.:
+34: 
+35: ----
+36: net stop "Network UPS Tools"
+37: net start "Network UPS Tools"
+38: sc query "Network UPS Tools"
+39: ----
+40: 
+41: You can also execute `nut start` to automatically register the service
+42: (if not yet registered) and start it, and `nut stop` to stop the service
+43: (if registered and running), and `nut status` to check on it (if registered).
+44: 
+45: Note that for a Windows machine to act as a NUT data server for further
+46: clients, you may have to add Windows Firewall rules to allow incoming
+47: connections (by default to port `3493/tcp`), e.g. using PowerShell to
+48: elevate (alternately right-click a "Command Prompt" shortcut and select
+49: "Run as administrator"), and execute `netsh` to actually configure the
+50: needed "Advanced Firewall" rule (align the path to binary with your
+51: installation):
+52: 
+53: ----
+54: REM Elevate to administrator status then run netsh to add firewall rule.
+55: REM Recommended to adapt "LocalIP" to expected listeners of this server,
+56: REM and "RemoteIP" to your single or comma-separated subnet(s) in CIDR
+57: REM notation, specific client IP address(es), or ranges of address(es)
+58: REM (dash-separated, as IP1-IP2).
+59: 
+60: REM The following goes as one long command line:
+61: 
+62: powershell.exe -Command "Start-Process netsh.exe -ArgumentList
+63:   \"advfirewall firewall add rule name=NUT-upsd-data-server
+64:     dir=in action=allow localip=ANY remoteip=ANY
+65:     program=%ProgramFiles%\NUT\sbin\upsd.exe
+66:     localport=3493 protocol=tcp\" -Verb RunAs"
+67: ----
+68: 
+69: Keep in mind that by default NUT linkman:upsd[8] only listens on `localhost`,
+70: so you would need to add some `LISTEN` directives in linkman:upsd.conf[5] as
+71: well in this case.
+72: 
+73: OPTIONS
+74: -------
+75: 
+76: *nut.exe* is currently launched with no arguments when it is intended to
+77: run as the implementation of a registered Windows service; it would error
+78: out otherwise.
+79: 
+80: */?*::
+81: Display the help text and exit.
+82: 
+83: *-h*::
+84: Display the help text and exit.
+85: 
+86: *-V*::
+87: Display NUT version and exit.
+88: 
+89: *-D*::
+90: Raise the debug level.  Use this multiple times for additional details.
+91: The non-trivial debug level would be passed down to launched NUT programs.
+92: Primarily useful for troubleshooting with the non-service mode.
+93: 
+94: *-I*::
+95: Install as a Windows service called "Network UPS Tools". Does not start it.
+96: 
+97: *-U*::
+98: (Try to stop and) Uninstall the Windows service called "Network UPS Tools".
+99: 
+100: *-N*::
+101: Run once in non-service mode (for troubleshooting).
+102: +
+103: Since NUT v2.8.5, using `nut.exe -N` for testing and pressing 'Ctrl+C' should
+104: cause the started daemons to be killed off.  Previously they would linger and
+105: e.g. preclude subsequent experiments with the service wrapper.  Console close
+106: events are ignored, so there is a way to indefinitely keep the daemons started
+107: by the test-mode wrapper running (kill later if needed via Task Manager).
+108: 
+109: *start*::
+110: Install as a Windows service called "Network UPS Tools" (if not yet done),
+111: and try to start this service.
+112: 
+113: *stop*::
+114: Try to stop a Windows service called "Network UPS Tools".
+115: 
+116: *restart*::
+117: Try to stop a Windows service called "Network UPS Tools" (do not fail if
+118: we can not), then try to install it (if not yet done) and start it.
+119: 
+120: *status*::
+121: Try to query status of a Windows service called "Network UPS Tools".
+122: 
+123: DIAGNOSTICS
+124: -----------
+125: 
+126: *nut.exe* should not interact with console message buffers (`stdout`, `stderr`)
+127: much, except when explicitly asked to (e.g. displaying help and NUT version,
+128: running with verbose debug mode) or when exiting after an attempted service
+129: initialization while not running in a service context.
+130: 
+131: Most of normal logging from *nut.exe* goes to the Windows Event Log.
+132: 
+133: Launched NUT programs may emit messages of their own; their fate when no
+134: console is attached is questionable. The service may be cheerfully "running"
+135: (as long as `MODE=...` is set in `nut.conf`), but specific daemons under it
+136: might refuse to start. For example, it may be troublesome to see (without
+137: perusing the Windows Event Log, Applications section) whether they are missing
+138: some configuration file or entry. You may have to launch respective daemons
+139: manually to check what they complain about, or use *nut.exe -N* mode,
+140: all with raised NUT debug verbosity settings.
+141: 
+142: SEE ALSO
+143: --------
+144: 
+145: linkman:nut.conf[5], linkman:ups.conf[5], linkman:nutupsdrv[8],
+146: linkman:upsd[8], linkman:upsd.conf[5], linkman:upsd.users[5],
+147: linkman:upsmon[8], linkman:upsmon.conf[5]
+148: 
+149: Internet resources:
+150: ~~~~~~~~~~~~~~~~~~~

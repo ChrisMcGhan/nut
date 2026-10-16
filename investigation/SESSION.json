@@ -1,0 +1,8 @@
+{
+  "session": "ses_f54e9204affeTq9AJRyc7j6zmr",
+  "model": "ollama/deepseek-r1:32b",
+  "base_sha": "fe4e6fec3807017418c6fbc19b007a660d8e409c",
+  "scope": "source investigation only",
+  "api_helper": "/Users/chrismcghan/.config/opencode-supervisor/control.py",
+  "directory": "/Users/chrismcghan/Projects/nut-windows-client"
+}
